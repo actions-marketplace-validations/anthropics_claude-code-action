@@ -1,5 +1,5 @@
 import * as core from "@actions/core";
-import { readFile, writeFile, access } from "fs/promises";
+import { readFile, access } from "fs/promises";
 import { dirname, join } from "path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
@@ -8,8 +8,14 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ParsedSdkOptions } from "./parse-sdk-options";
+import { writeExecutionFile } from "./execution-file";
 
-const EXECUTION_FILE = `${process.env.RUNNER_TEMP}/claude-execution-output.json`;
+export type ClaudeRunResult = {
+  executionFile?: string;
+  sessionId?: string;
+  conclusion: "success" | "failure";
+  structuredOutput?: string;
+};
 
 /** Filename for the user request file, written by prompt generation */
 const USER_REQUEST_FILENAME = "claude-user-request.txt";
@@ -112,7 +118,7 @@ function sanitizeSdkOutput(
         duration_ms: resultMsg.duration_ms,
         num_turns: resultMsg.num_turns,
         total_cost_usd: resultMsg.total_cost_usd,
-        permission_denials: resultMsg.permission_denials,
+        permission_denials_count: resultMsg.permission_denials?.length ?? 0,
       },
       null,
       2,
@@ -129,7 +135,7 @@ function sanitizeSdkOutput(
 export async function runClaudeWithSdk(
   promptPath: string,
   { sdkOptions, showFullOutput, hasJsonSchema }: ParsedSdkOptions,
-): Promise<void> {
+): Promise<ClaudeRunResult> {
   // Create prompt configuration - may be a string or multi-block message
   const prompt = await createPromptConfig(promptPath, showFullOutput);
 
@@ -144,7 +150,7 @@ export async function runClaudeWithSdk(
 
   console.log(`Running Claude with prompt from file: ${promptPath}`);
   // Log SDK options without env (which could contain sensitive data)
-  const { env, ...optionsToLog } = sdkOptions;
+  const { env, extraArgs, ...optionsToLog } = sdkOptions;
   console.log("SDK options:", JSON.stringify(optionsToLog, null, 2));
 
   const messages: SDKMessage[] = [];
@@ -165,36 +171,35 @@ export async function runClaudeWithSdk(
     }
   } catch (error) {
     console.error("SDK execution error:", error);
-    core.setOutput("conclusion", "failure");
-    process.exit(1);
+    await writeExecutionFile(messages);
+    throw new Error(`SDK execution error: ${error}`);
   }
 
-  // Write execution file
-  try {
-    await writeFile(EXECUTION_FILE, JSON.stringify(messages, null, 2));
-    console.log(`Log saved to ${EXECUTION_FILE}`);
-    core.setOutput("execution_file", EXECUTION_FILE);
-  } catch (error) {
-    core.warning(`Failed to write execution file: ${error}`);
+  const result: ClaudeRunResult = {
+    conclusion: "failure",
+  };
+
+  const executionFile = await writeExecutionFile(messages);
+  if (executionFile) {
+    result.executionFile = executionFile;
   }
 
-  // Extract and set session_id from system.init message
+  // Extract session_id from system.init message
   const initMessage = messages.find(
     (m) => m.type === "system" && "subtype" in m && m.subtype === "init",
   );
   if (initMessage && "session_id" in initMessage && initMessage.session_id) {
-    core.setOutput("session_id", initMessage.session_id);
-    core.info(`Set session_id: ${initMessage.session_id}`);
+    result.sessionId = initMessage.session_id as string;
+    core.info(`Set session_id: ${result.sessionId}`);
   }
 
   if (!resultMessage) {
-    core.setOutput("conclusion", "failure");
     core.error("No result message received from Claude");
-    process.exit(1);
+    throw new Error("No result message received from Claude");
   }
 
   const isSuccess = resultMessage.subtype === "success";
-  core.setOutput("conclusion", isSuccess ? "success" : "failure");
+  result.conclusion = isSuccess ? "success" : "failure";
 
   // Handle structured output
   if (hasJsonSchema) {
@@ -203,10 +208,7 @@ export async function runClaudeWithSdk(
       "structured_output" in resultMessage &&
       resultMessage.structured_output
     ) {
-      const structuredOutputJson = JSON.stringify(
-        resultMessage.structured_output,
-      );
-      core.setOutput("structured_output", structuredOutputJson);
+      result.structuredOutput = JSON.stringify(resultMessage.structured_output);
       core.info(
         `Set structured_output with ${Object.keys(resultMessage.structured_output as object).length} field(s)`,
       );
@@ -214,8 +216,10 @@ export async function runClaudeWithSdk(
       core.setFailed(
         `--json-schema was provided but Claude did not return structured_output. Result subtype: ${resultMessage.subtype}`,
       );
-      core.setOutput("conclusion", "failure");
-      process.exit(1);
+      result.conclusion = "failure";
+      throw new Error(
+        `--json-schema was provided but Claude did not return structured_output. Result subtype: ${resultMessage.subtype}`,
+      );
     }
   }
 
@@ -223,6 +227,14 @@ export async function runClaudeWithSdk(
     if ("errors" in resultMessage && resultMessage.errors) {
       core.error(`Execution failed: ${resultMessage.errors.join(", ")}`);
     }
-    process.exit(1);
+    throw new Error(
+      `Claude execution failed: ${
+        "errors" in resultMessage && resultMessage.errors
+          ? resultMessage.errors.join(", ")
+          : "unknown error"
+      }`,
+    );
   }
+
+  return result;
 }
